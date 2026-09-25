@@ -17,6 +17,7 @@
 """
 from __future__ import annotations
 
+import bisect
 import math
 from typing import Collection, List, Literal, Optional, Tuple, TypeVar
 
@@ -1414,4 +1415,344 @@ def staple_plan(
         "min_spacing_mm": min_spacing_mm,
         "signature_count": signature_total,
         "signatures": result_signatures,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 原纸备料（stock-plan）：按纸纹朝向计算单张出数，并在库存内优选原纸组合
+# ---------------------------------------------------------------------------
+
+# 原纸规格数量、单规格库存张数允许范围
+STOCK_SPEC_MIN_COUNT = 1
+STOCK_SPEC_MAX_COUNT = 6
+STOCK_INVENTORY_MAX = 30
+
+# 纸纹方向：width=纸纹沿原纸宽度，height=纸纹沿原纸高度
+GrainDirection = Literal["width", "height"]
+
+# 单种原纸：(宽度 mm, 高度 mm, 库存张数, 纸纹方向)
+StockPaper = Tuple[int, int, int, GrainDirection]
+
+# 尺寸比较的浮点容差：仅抵消留边/间隔浮点运算的 ULP 级偏差，
+# 使“恰好排满整数行/列”不被误判为差一丝而少排一行/一列
+STOCK_FIT_EPS = 1e-9
+
+
+def _fit_count(usable: float, item: float, spacing: float) -> int:
+    """整行/整列排布数量：``n`` 个成品加 ``n-1`` 个间隔占 ``n*item + (n-1)*spacing``。
+
+    即 ``n ≤ (usable + spacing) / (item + spacing)``，向下取整；
+    可用长度小于单个成品时结果为 0（公式自身给出非正值，夹回 0）。
+    """
+    if usable < item - STOCK_FIT_EPS * max(1.0, abs(usable), item):
+        return 0
+    if item + spacing <= 0:
+        return 0
+    count = int(math.floor((usable + spacing) / (item + spacing) + STOCK_FIT_EPS))
+    return max(0, count)
+
+
+def _pieces_per_sheet(
+    stock_width_mm: int,
+    stock_height_mm: int,
+    grain: GrainDirection,
+    sheet_width_mm: float,
+    sheet_height_mm: float,
+    margin_mm: float,
+    spacing_mm: float,
+) -> Tuple[int, int, int, float, float]:
+    """计算单张原纸在唯一合法朝向下的整行整列出数。
+
+    成品书脊沿页高，只能按**书脊与纸纹平行**落版（不允许旋转调换朝向）：
+
+    - ``grain="height"``：成品高（书脊方向）沿原纸高，成品宽沿原纸宽；
+    - ``grain="width"``：成品高（书脊方向）沿原纸宽，成品宽沿原纸高。
+
+    扣除四周留边后的可用区域为
+    ``(原纸宽 − 2 × 留边) × (原纸高 − 2 × 留边)``，成品之间留出统一裁切间隔，
+    行列均按整行整列排满。返回 ``(单张出数, 列数, 行数, 可用宽, 可用高)``。
+    """
+    if grain not in ("width", "height"):
+        raise ValueError(f"非法纸纹方向：{grain!r}，只支持 'width' / 'height'")
+    usable_w = stock_width_mm - 2 * margin_mm
+    usable_h = stock_height_mm - 2 * margin_mm
+    if grain == "height":
+        columns = _fit_count(usable_w, sheet_width_mm, spacing_mm)
+        rows = _fit_count(usable_h, sheet_height_mm, spacing_mm)
+    else:
+        # 成品旋转 90° 落版（书脊与沿宽纸纹平行）：成品高沿原纸宽、成品宽沿原纸高
+        columns = _fit_count(usable_w, sheet_height_mm, spacing_mm)
+        rows = _fit_count(usable_h, sheet_width_mm, spacing_mm)
+    return columns * rows, columns, rows, usable_w, usable_h
+
+
+def _choose_stock_usage(
+    pieces: List[int],
+    area_weights: List[int],
+    inventories: List[int],
+    demand: int,
+) -> Optional[Tuple[int, ...]]:
+    """库存内优选用量组合（折半枚举）。
+
+    参数：单张出数 ``pieces``、单张面积 ``area_weights``（mm²，整数）、库存张数
+    ``inventories``、总需求 ``demand``。在 ``0 ≤ u[i] ≤ inventories[i]`` 且
+    ``Σ u[i]·pieces[i] ≥ demand`` 的组合中，依次最小化
+    ``(Σ u[i]·area_weights[i], Σ u[i]·pieces[i], u 字典序)``；
+    无可行组合返回 ``None``。
+    """
+    n = len(pieces)
+    split = n // 2
+    left_indices = list(range(split))
+    right_indices = list(range(split, n))
+
+    def enumerate_part(indices: List[int]) -> List[Tuple[int, int, Tuple[int, ...]]]:
+        """枚举这一半规格的全部用量组合 (产量, 面积, 各规格用量)。"""
+        combos: List[Tuple[int, int, Tuple[int, ...]]] = [(0, 0, ())]
+        for idx in indices:
+            extended: List[Tuple[int, int, Tuple[int, ...]]] = []
+            for production, area, usage in combos:
+                for used in range(inventories[idx] + 1):
+                    extended.append(
+                        (
+                            production + used * pieces[idx],
+                            area + used * area_weights[idx],
+                            usage + (used,),
+                        )
+                    )
+            combos = extended
+        return combos
+
+    left_combos = enumerate_part(left_indices)
+    right_combos = enumerate_part(right_indices)
+
+    # 同一半内安全剪枝：(产量, 面积) 完全相同的组合只保留用量字典序最小者
+    # （面积、产量均相同，字典序最小者在任何搭档下都最优）。不能按面积或
+    # 产量单独支配剪枝——更大面积的左半组合可能与更省的右半组合拼成全局最优。
+    # enumerate_part 按用量字典序生成，稳定排序后同键组合天然保持字典序。
+    def dedup(
+        combos: List[Tuple[int, int, Tuple[int, ...]]],
+    ) -> List[Tuple[int, int, Tuple[int, ...]]]:
+        combos.sort(key=lambda item: (item[0], item[1]))
+        unique: List[Tuple[int, int, Tuple[int, ...]]] = []
+        for combo in combos:
+            if unique and (combo[0], combo[1]) == (unique[-1][0], unique[-1][1]):
+                continue
+            unique.append(combo)
+        return unique
+
+    left_combos = dedup(left_combos)
+    right_combos = dedup(right_combos)
+
+    # suffix_best[k] = left_combos[k:]（产量不小于第 k 档）中使
+    # (面积, 产量, 用量字典序) 最小的组合。对固定的右半组合，左半只需满足
+    # 产量下界；面积为全局第一目标，故阈值之上该键最小者即最佳搭档。
+    suffix_best: List[int] = [0] * len(left_combos)
+    running = len(left_combos) - 1
+    for k in range(len(left_combos) - 1, -1, -1):
+        candidate = left_combos[k]
+        if k == len(left_combos) - 1 or (
+            candidate[1],
+            candidate[0],
+            candidate[2],
+        ) < (
+            left_combos[running][1],
+            left_combos[running][0],
+            left_combos[running][2],
+        ):
+            running = k
+        suffix_best[k] = running
+    left_productions = [combo[0] for combo in left_combos]
+
+    best: Optional[Tuple[int, int, Tuple[int, ...]]] = None
+    for r_production, r_area, r_usage in right_combos:
+        required_left = demand - r_production
+        # bisect_left：左半产量 ≥ required_left 的第一档；
+        # required_left ≤ 0 时下界为 0（允许左半一张不用）
+        k = bisect.bisect_left(left_productions, max(0, required_left))
+        if k >= len(left_combos):
+            continue
+        l_production, l_area, l_usage = left_combos[suffix_best[k]]
+        candidate = (
+            r_production + l_production,
+            r_area + l_area,
+            l_usage + r_usage,
+        )
+        # 全局键：面积优先、总产量（超产）次之、用量字典序最后
+        key = (candidate[1], candidate[0], candidate[2])
+        if best is None or key < (best[1], best[0], best[2]):
+            best = candidate
+
+    if best is None:
+        return None
+    return best[2]
+
+
+def plan_stock(
+    total_pages: int,
+    max_sheets: int,
+    binding: Binding,
+    page_width_mm: float,
+    page_height_mm: float,
+    gutter_mm: float,
+    copies: int,
+    papers: List[StockPaper],
+    margin_mm: float,
+    spacing_mm: float,
+) -> dict:
+    """原纸备料：计算每册印张需求并在库存原纸中优选组合。
+
+    需求与成品尺寸沿用拼版/机台版面：
+
+    - 每册印张数沿用 :func:`impose` 的分帖结果（含末帖补白张，每张 4 页），
+      总需求 = 每册印张数 × 印数 ``copies``；
+    - 成品印张尺寸沿用机台版面：宽 ``2 × 页宽 + 中缝``、高 = 页高，
+      书脊沿页高方向。
+
+    每种原纸给整数毫米宽高、库存张数（0～30）与纸纹方向（``width`` 沿宽 /
+    ``height`` 沿高）。成品只能按**书脊与纸纹平行**的唯一朝向，在扣除四周
+    统一留边 ``margin_mm`` 的可用区域内、按统一裁切间隔 ``spacing_mm``
+    整行整列排满，得到该规格单张出数。
+
+    在各规格库存张数内选择用量组合，使总产量满足总需求，并依次最小化：
+    原纸总面积 → 超产张数（总产量 − 总需求）→ 按输入顺序的用量字典序。
+    无可行组合（含全部规格单张出数均为 0）时抛 ``ValueError``。
+    """
+    if binding not in ("left", "right"):
+        raise ValueError(f"非法装订方向：{binding!r}，只支持 'left' / 'right'")
+    if (
+        not isinstance(total_pages, int)
+        or isinstance(total_pages, bool)
+        or total_pages < 1
+    ):
+        raise ValueError("总页数 total_pages 必须为正整数")
+    if not isinstance(max_sheets, int) or isinstance(max_sheets, bool) or max_sheets < 1:
+        raise ValueError("每帖最多纸张数 max_sheets 必须为正整数")
+    for name, value in (
+        ("页宽", page_width_mm),
+        ("页高", page_height_mm),
+    ):
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise ValueError(f"{name}必须为正数（有限数值，单位 mm）")
+    if (
+        not isinstance(gutter_mm, (int, float))
+        or isinstance(gutter_mm, bool)
+        or not math.isfinite(gutter_mm)
+        or gutter_mm < 0
+    ):
+        raise ValueError("中缝宽度必须为非负数（有限数值，单位 mm）")
+    if not isinstance(copies, int) or isinstance(copies, bool) or copies < 1:
+        raise ValueError("印数 copies 必须为正整数")
+    for name, value in (("四周留边", margin_mm), ("裁切间隔", spacing_mm)):
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise ValueError(f"{name}必须为非负有限数值（单位 mm）")
+    if not (
+        isinstance(papers, list)
+        and STOCK_SPEC_MIN_COUNT <= len(papers) <= STOCK_SPEC_MAX_COUNT
+    ):
+        raise ValueError(
+            f"原纸规格必须为 {STOCK_SPEC_MIN_COUNT}～{STOCK_SPEC_MAX_COUNT} 种"
+        )
+
+    signatures = impose(total_pages, max_sheets, binding)
+    sheets_per_copy = sum(signature["sheet_count"] for signature in signatures)
+    demand = sheets_per_copy * copies
+
+    sheet_width = 2 * page_width_mm + gutter_mm
+    sheet_height = page_height_mm
+
+    pieces: List[int] = []
+    areas: List[int] = []
+    inventories: List[int] = []
+    paper_results: List[dict] = []
+    for index, paper in enumerate(papers, start=1):
+        if len(paper) != 4:
+            raise ValueError(f"第 {index} 种原纸字段不完整")
+        width, height, inventory, grain = paper
+        for name, value in (("宽", width), ("高", height), ("库存", inventory)):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+                raise ValueError(f"第 {index} 种原纸的{name}必须为非负整数")
+        if width < 1 or height < 1:
+            raise ValueError(f"第 {index} 种原纸的宽、高必须为正整数（mm）")
+        if inventory > STOCK_INVENTORY_MAX:
+            raise ValueError(
+                f"第 {index} 种原纸的库存不能超过 {STOCK_INVENTORY_MAX} 张"
+            )
+        per_sheet, columns, rows, usable_w, usable_h = _pieces_per_sheet(
+            width, height, grain, sheet_width, sheet_height, margin_mm, spacing_mm
+        )
+        pieces.append(per_sheet)
+        areas.append(width * height)
+        inventories.append(inventory)
+        paper_results.append(
+            {
+                "paper_index": index,
+                "width_mm": width,
+                "height_mm": height,
+                "grain": grain,
+                "inventory": inventory,
+                "pieces_per_sheet": per_sheet,
+                "columns": columns,
+                "rows": rows,
+                "usable_width_mm": usable_w,
+                "usable_height_mm": usable_h,
+                "used": 0,
+                "production": 0,
+                "area_mm2": 0,
+            }
+        )
+
+    capacity = sum(
+        inventory * per_sheet
+        for inventory, per_sheet in zip(inventories, pieces)
+    )
+    if capacity < demand:
+        raise ValueError(
+            f"库存原纸满负荷最多产出 {capacity} 张成品印张，"
+            f"无法满足总需求 {demand} 张（每册 {sheets_per_copy} 张 × 印数 {copies}）"
+        )
+
+    usage = _choose_stock_usage(pieces, areas, inventories, demand)
+    # 容量预判已保证可行；防御性处理避免 None 误下发
+    if usage is None:  # pragma: no cover - 容量上界已保证存在可行组合
+        raise ValueError("无可行原纸组合")
+
+    total_production = 0
+    total_area = 0
+    for item, used in zip(paper_results, usage):
+        per_sheet = pieces[item["paper_index"] - 1]
+        item["used"] = used
+        item["production"] = used * per_sheet
+        item["area_mm2"] = used * areas[item["paper_index"] - 1]
+        total_production += item["production"]
+        total_area += item["area_mm2"]
+
+    return {
+        "total_pages": total_pages,
+        "max_sheets_per_signature": max_sheets,
+        "binding": binding,
+        "page_width_mm": page_width_mm,
+        "page_height_mm": page_height_mm,
+        "gutter_mm": gutter_mm,
+        "copies": copies,
+        "margin_mm": margin_mm,
+        "spacing_mm": spacing_mm,
+        "signature_count": len(signatures),
+        "sheets_per_copy": sheets_per_copy,
+        "total_demand": demand,
+        "sheet_width_mm": sheet_width,
+        "sheet_height_mm": sheet_height,
+        "papers": paper_results,
+        "total_production": total_production,
+        "surplus": total_production - demand,
+        "total_area_mm2": total_area,
     }

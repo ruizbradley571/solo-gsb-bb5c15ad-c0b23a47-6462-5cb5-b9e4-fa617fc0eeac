@@ -16,6 +16,7 @@ from .imposition import (
     inspect_observed_sheets,
     locate_defects,
     plan_reprint,
+    plan_stock,
     press_layout,
     staple_plan,
     UNREAD,
@@ -45,8 +46,12 @@ app = FastAPI(
         "支持双面拼版校样：按机台版面输出可下载的 proof.pdf。"
         "支持订针计划：沿用分帖结果，在页高整数毫米刻度上避开留边与按帖禁针闭区间，"
         "以最大绝对偏差最小（并列再比偏差总和、针位字典序）为每帖规划递增订针针位。"
+        "支持原纸备料：沿用拼版参数计算每册印张数并乘印数得到总需求，沿用机台版面的"
+        "成品印张尺寸；在扣除四周留边的可用区域内按书脊与纸纹平行的唯一朝向整行整列"
+        "排布，给出各规格单张出数，并在库存内选择总面积最小（并列再比超产、用量字典序）"
+        "的原纸组合。"
     ),
-    version="1.8.0",
+    version="1.9.0",
 )
 
 
@@ -843,6 +848,159 @@ class StaplePlanResponse(BaseModel):
     signatures: list[StaplePlanSignature]
 
 
+# ---------------------------------------------------------------------------
+# 原纸备料 /api/v1/impose/stock-plan
+# ---------------------------------------------------------------------------
+
+
+class StockPaperSpec(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    width_mm: int = Field(..., ge=1, description="原纸宽度（mm），正整数")
+    height_mm: int = Field(..., ge=1, description="原纸高度（mm），正整数")
+    inventory: int = Field(..., ge=0, le=30, description="库存张数，0～30 的整数")
+    grain: Literal["width", "height"] = Field(
+        ..., description="纸纹方向：width=纸纹沿原纸宽度，height=纸纹沿原纸高度"
+    )
+
+    @field_validator("width_mm", "height_mm", "inventory", mode="before")
+    @classmethod
+    def reject_non_integer(cls, value):
+        # 宽高与库存必须是严格整数（不接受布尔值或小数）
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("必须为整数（不接受布尔值或小数）")
+        return value
+
+
+class StockPlanRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    total_pages: int = Field(
+        ..., ge=1, description="总页数，正整数（沿用普通拼版的分帖参数）"
+    )
+    max_sheets_per_signature: int = Field(
+        ..., ge=1, description="每帖最多纸张数，正整数；每帖最多容纳其 4 倍页数"
+    )
+    binding: Literal["left", "right"] = Field(
+        ..., description="装订方向：left=左装订，right=右装订"
+    )
+    page_width_mm: float = Field(..., description="单页宽度（mm），正数")
+    page_height_mm: float = Field(..., description="单页高度（mm），正数；书脊沿页高")
+    gutter_mm: float = Field(..., description="中缝宽度（mm），非负数")
+    copies: int = Field(..., ge=1, description="印数，正整数")
+    papers: list[StockPaperSpec] = Field(
+        ...,
+        min_length=1,
+        max_length=6,
+        description="原纸规格列表，1～6 种；按输入顺序作为用量字典序与结果顺序",
+    )
+    margin_mm: float = Field(
+        ..., description="原纸四周统一留边（mm），非负有限数值"
+    )
+    spacing_mm: float = Field(
+        ..., description="相邻成品印张之间的统一裁切间隔（mm），非负有限数值"
+    )
+
+    @field_validator("copies", mode="before")
+    @classmethod
+    def reject_non_integer_copies(cls, value):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("印数必须为整数（不接受布尔值或小数）")
+        return value
+
+    @field_validator("page_width_mm", "page_height_mm")
+    @classmethod
+    def validate_positive_mm(cls, value: float) -> float:
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("页宽、页高必须为正数（有限数值，单位 mm）")
+        return value
+
+    @field_validator("gutter_mm", "margin_mm", "spacing_mm")
+    @classmethod
+    def validate_non_negative_mm(cls, value: float) -> float:
+        if not math.isfinite(value) or value < 0:
+            raise ValueError("中缝、留边与裁切间隔必须为非负数（有限数值，单位 mm）")
+        return value
+
+    @model_validator(mode="after")
+    def validate_stock_plan(self) -> "StockPlanRequest":
+        # 每册印张数、成品尺寸、单张出数与库存可行性均由 plan_stock 统一校验，
+        # 失败抛 ValueError -> 422；响应结果在端点内重新计算
+        plan_stock(
+            total_pages=self.total_pages,
+            max_sheets=self.max_sheets_per_signature,
+            binding=self.binding,
+            page_width_mm=self.page_width_mm,
+            page_height_mm=self.page_height_mm,
+            gutter_mm=self.gutter_mm,
+            copies=self.copies,
+            papers=[
+                (p.width_mm, p.height_mm, p.inventory, p.grain)
+                for p in self.papers
+            ],
+            margin_mm=self.margin_mm,
+            spacing_mm=self.spacing_mm,
+        )
+        return self
+
+
+class StockPaperResult(BaseModel):
+    paper_index: int = Field(..., description="原纸规格序号，从 1 开始（按请求顺序）")
+    width_mm: int = Field(..., description="原纸宽度（mm）")
+    height_mm: int = Field(..., description="原纸高度（mm）")
+    grain: Literal["width", "height"] = Field(
+        ..., description="纸纹方向：width=沿宽，height=沿高"
+    )
+    inventory: int = Field(..., description="库存张数（0～30）")
+    pieces_per_sheet: int = Field(
+        ..., description="该规格单张原纸的成品印张出数（整行 × 整列）"
+    )
+    columns: int = Field(..., description="单张沿原纸宽度方向排布的成品列数")
+    rows: int = Field(..., description="单张沿原纸高度方向排布的成品行数")
+    usable_width_mm: float = Field(
+        ..., description="扣除四周留边后的可用宽度（mm）= 原纸宽 − 2 × 留边"
+    )
+    usable_height_mm: float = Field(
+        ..., description="扣除四周留边后的可用高度（mm）= 原纸高 − 2 × 留边"
+    )
+    used: int = Field(..., description="选中的用量（张），不超过库存")
+    production: int = Field(..., description="该规格总产量 = 用量 × 单张出数")
+    area_mm2: int = Field(..., description="该规格耗用总面积（mm²）= 用量 × 单张面积")
+
+
+class StockPlanResponse(BaseModel):
+    total_pages: int
+    max_sheets_per_signature: int
+    binding: Literal["left", "right"]
+    page_width_mm: float
+    page_height_mm: float
+    gutter_mm: float
+    copies: int = Field(..., description="印数（正整数）")
+    margin_mm: float = Field(..., description="四周留边（mm）")
+    spacing_mm: float = Field(..., description="裁切间隔（mm）")
+    signature_count: int = Field(..., description="沿用拼版结果的帖数")
+    sheets_per_copy: int = Field(
+        ..., description="每册印张数（沿用拼版分帖结果，含末帖补白张）"
+    )
+    total_demand: int = Field(
+        ..., description="总需求 = 每册印张数 × 印数"
+    )
+    sheet_width_mm: float = Field(
+        ..., description="成品印张宽度（mm）= 2 × 页宽 + 中缝"
+    )
+    sheet_height_mm: float = Field(..., description="成品印张高度（mm）= 页高")
+    papers: list[StockPaperResult] = Field(
+        ..., description="各规格原纸的单张出数、排布与用量结果，按请求顺序"
+    )
+    total_production: int = Field(..., description="选中组合的成品印张总产量")
+    surplus: int = Field(
+        ..., description="余量（超产）= 总产量 − 总需求，非负整数"
+    )
+    total_area_mm2: int = Field(
+        ..., description="选中组合耗用的原纸总面积（mm²），为可行组合中的最小值"
+    )
+
+
 @app.get("/health", tags=["健康检查"])
 def health() -> dict:
     return {"status": "ok"}
@@ -1133,6 +1291,34 @@ def create_staple_plan(request: StaplePlanRequest) -> StaplePlanResponse:
         ],
     )
     return StaplePlanResponse(**result)
+
+
+@app.post(
+    "/api/v1/impose/stock-plan",
+    response_model=StockPlanResponse,
+    tags=["备料"],
+    summary="原纸备料：单张出数与库存内总面积最小的原纸组合优选",
+    responses={
+        422: {"description": "参数非法，或库存原纸无法满足总需求（错误信息给出产能与需求）"},
+    },
+)
+def create_stock_plan(request: StockPlanRequest) -> StockPlanResponse:
+    result = plan_stock(
+        total_pages=request.total_pages,
+        max_sheets=request.max_sheets_per_signature,
+        binding=request.binding,
+        page_width_mm=request.page_width_mm,
+        page_height_mm=request.page_height_mm,
+        gutter_mm=request.gutter_mm,
+        copies=request.copies,
+        papers=[
+            (p.width_mm, p.height_mm, p.inventory, p.grain)
+            for p in request.papers
+        ],
+        margin_mm=request.margin_mm,
+        spacing_mm=request.spacing_mm,
+    )
+    return StockPlanResponse(**result)
 
 
 def _json_safe(value: object) -> object:
