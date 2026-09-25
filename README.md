@@ -35,6 +35,14 @@
 在页高内的整数毫米刻度上为每帖规划递增针位，使相对理想针位的最大绝对偏差最小
 （并列时先比偏差总和、再比针位序列字典序），逐帖返回针位与最大偏差；某帖无可行排列时返回指出帖号的 422。
 
+还提供**原纸备料**接口 `/api/v1/impose/paper-stock`：沿用拼版参数计算每册印张数（含末帖补白的
+⌈总页数 / 4⌉，与每帖张数无关）并乘印数得到成品印张总需求，沿用机台版面的成品印张尺寸
+（宽 = 2 × 页宽 + 中缝、高 = 页高，书脊沿页高）。输入 1～6 种原纸的整数毫米宽高、各 0～30 张库存、
+沿宽或沿高的纸纹以及统一的四周留边与裁切间隔；成品印张只能取**书脊与纸纹平行**的唯一朝向，
+在扣除留边的可用区域内整行整列排布，给出各规格的列数、行数与单张出数。随后在库存内选出满足需求且
+**原纸总面积最小**的组合（面积并列时依次比超产最少、按输入顺序的用量字典序最小），返回各规格用量、
+单张出数、总产量与余量；库存总产能不足、无可行组合时返回明确的 422。
+
 ## 一条命令启动
 
 需要安装 Docker（含 Compose 插件），在项目根目录执行：
@@ -80,6 +88,7 @@ HOST_PORT=9000 docker compose up -d --build
 - 墨区着墨面积接口：`POST http://localhost:8000/api/v1/impose/ink-zones`
 - 双面拼版校样（PDF 下载）：`POST http://localhost:8000/api/v1/impose/proof.pdf`
 - 订针计划接口：`POST http://localhost:8000/api/v1/impose/staple-plan`
+- 原纸备料接口：`POST http://localhost:8000/api/v1/impose/paper-stock`
 
 ## 接口说明
 
@@ -658,6 +667,148 @@ curl -X POST http://localhost:8000/api/v1/impose/staple-plan \
   返回 `422 Unprocessable Entity`，错误信息指出帖号，例如
   `Value error, 第 2 帖无可行订针排列`。
 
+## 原纸备料（POST /api/v1/impose/paper-stock）
+
+上机开料前，根据成品印张尺寸与车间原纸库存选择**总面积最小的备料组合**。本地访问地址
+`http://localhost:8000/api/v1/impose/paper-stock`（改了 `HOST_PORT` 则对应替换端口）。
+
+- **每册印张数沿用拼版参数**：每张印张 4 页，含末帖补白，
+  `sheets_per_book = ⌈total_pages / 4⌉`（与 `max_sheets_per_signature` 无关，`binding` 仍照常传入）；
+  成品印张总需求 `demand = sheets_per_book × copies`。
+- **成品印张尺寸沿用机台版面**：宽 `finished_sheet_width_mm = 2 × page_width_mm + gutter_mm`、
+  高 `finished_sheet_height_mm = page_height_mm`；**成品书脊沿页高方向**。
+
+### 请求
+
+`POST /api/v1/impose/paper-stock`，`Content-Type: application/json`
+
+| 字段 | 类型 | 约束 | 说明 |
+| --- | --- | --- | --- |
+| `total_pages` | 整数 | ≥ 1 | 总页数（正整数），沿用普通拼版的分帖参数 |
+| `max_sheets_per_signature` | 整数 | ≥ 1 | 每帖最多纸张数（仅用于沿用拼版参数，不影响每册印张数） |
+| `binding` | 字符串 | `left` / `right` | 装订方向：左装订 / 右装订 |
+| `page_width_mm` | 数值 | 正数（有限值） | 单页宽度（mm） |
+| `page_height_mm` | 数值 | 正数（有限值） | 单页高度（mm）；成品书脊沿此方向 |
+| `gutter_mm` | 数值 | ≥ 0（有限值） | 中缝宽度（mm） |
+| `copies` | 整数 | ≥ 1（严格整数） | 印数；总需求 = 每册印张数 × 印数 |
+| `margin_mm` | 数值 | ≥ 0（有限值） | 原纸**四周统一留边**（mm） |
+| `cut_gap_mm` | 数值 | ≥ 0（有限值） | 相邻成品印张之间**统一裁切间隔**（mm） |
+| `papers` | 对象数组 | 1～6 项 | 原纸规格列表，顺序即用量字典序与结果返回顺序 |
+| `papers[].width_mm` / `height_mm` | 整数 | ≥ 1（严格整数） | 原纸宽 / 高（mm） |
+| `papers[].stock` | 整数 | 0～30（严格整数） | 该规格库存张数 |
+| `papers[].grain` | 字符串 | `width` / `height` | 纸纹方向：`width`=沿原纸宽边，`height`=沿原纸高边 |
+
+```bash
+curl -X POST http://localhost:8000/api/v1/impose/paper-stock \
+  -H "Content-Type: application/json" \
+  -d '{
+    "total_pages": 4,
+    "max_sheets_per_signature": 1,
+    "binding": "left",
+    "page_width_mm": 210,
+    "page_height_mm": 297,
+    "gutter_mm": 0,
+    "copies": 100,
+    "margin_mm": 10,
+    "cut_gap_mm": 3,
+    "papers": [
+      {"width_mm": 880, "height_mm": 620, "stock": 30, "grain": "width"},
+      {"width_mm": 900, "height_mm": 640, "stock": 30, "grain": "height"}
+    ]
+  }'
+```
+
+### 开料与纸纹规则
+
+- **唯一朝向**：成品书脊（印张高边）必须与原纸纸纹平行，不允许另一朝向：
+  - `grain = "height"`（纸纹沿原纸高边）：列方向（原纸宽）排印张宽、行方向（原纸高）排印张高；
+  - `grain = "width"`（纸纹沿原纸宽边）：印张整体旋转 90°，列方向排印张高、行方向排印张宽。
+- **整行整列排布**：先扣除四周留边（可用宽 `width − 2 × margin`、可用高 `height − 2 × margin`），
+  成品印张在可用区域内按统一裁切间隔 `cut_gap_mm` 网格排布。某轴可排个数为
+
+  ```
+  可用长度 < 成品边长                  → 0
+  floor((可用长度 + cut_gap) / (成品边长 + cut_gap))   （≥ 1）
+  ```
+
+  单张出数 `pieces_per_sheet = columns × rows`；成品放不下时任一方向为 0、出数即为 0，
+  该规格用量必为 0。
+- **组合择优**：在每种规格用量不超过库存的所有满足总需求的组合中，依次
+  1. **最小化原纸总面积** `Σ used_sheets × width × height`；
+  2. 面积并列时**最小化超产**（总产量 − 总需求）；
+  3. 仍并列时取**按 `papers` 输入顺序的用量字典序最小**（即首位用量可小则小，
+     等面积方案中用量尽量压到输入靠后的规格）。
+
+### 响应
+
+顶层回显请求参数、成品印张尺寸、每册印张数与总需求；`papers` 按输入顺序逐规格给出
+纸纹、列数 `columns`、行数 `rows`、单张出数 `pieces_per_sheet`、单张面积 `sheet_area_mm2`
+与最终选用张数 `used_sheets`（未选用为 0）；顶层给出总面积 `total_area_mm2`、
+总产量 `total_produced` 与余量 `surplus`（超产张数）。
+
+上例中成品印张为 420 × 297、需求 100 张：
+
+- 880 × 620、纸纹沿宽：旋转后列排 297（可用宽 860，2 列）、行排 420（可用高 600，1 行）→ 单张 2 个；
+- 900 × 640、纸纹沿高：列排 420（可用宽 880，2 列）、行排 297（可用高 620，2 行）→ 单张 4 个；
+- 25 张第二种纸恰好 100 个、面积 14,400,000 mm²，为总面积最小的组合。
+
+```json
+{
+  "total_pages": 4,
+  "max_sheets_per_signature": 1,
+  "binding": "left",
+  "page_width_mm": 210.0,
+  "page_height_mm": 297.0,
+  "gutter_mm": 0.0,
+  "copies": 100,
+  "margin_mm": 10.0,
+  "cut_gap_mm": 3.0,
+  "finished_sheet_width_mm": 420.0,
+  "finished_sheet_height_mm": 297.0,
+  "sheets_per_book": 1,
+  "demand": 100,
+  "papers": [
+    {
+      "width_mm": 880,
+      "height_mm": 620,
+      "stock": 30,
+      "grain": "width",
+      "used_sheets": 0,
+      "columns": 2,
+      "rows": 1,
+      "pieces_per_sheet": 2,
+      "sheet_area_mm2": 545600
+    },
+    {
+      "width_mm": 900,
+      "height_mm": 640,
+      "stock": 30,
+      "grain": "height",
+      "used_sheets": 25,
+      "columns": 2,
+      "rows": 2,
+      "pieces_per_sheet": 4,
+      "sheet_area_mm2": 576000
+    }
+  ],
+  "total_area_mm2": 14400000,
+  "total_produced": 100,
+  "surplus": 0
+}
+```
+
+### 非法参数与无可行组合（4xx）
+
+- 分帖参数非法（`total_pages` / `max_sheets_per_signature` 小于 1、`binding` 取值非法）；
+- `page_width_mm` / `page_height_mm` 非正数（含 `0`、负数、`NaN`、`Infinity`），
+  `gutter_mm` / `margin_mm` / `cut_gap_mm` 为负或非有限值；
+- `copies` 小于 1 或不是严格整数；原纸宽高小于 1、库存不在 0～30、纸纹不是
+  `width` / `height`，或这些字段为小数 / 布尔值；`papers` 数量不在 1～6、缺字段或含未定义字段；
+- **无可行组合**：所有规格库存总产能（Σ 单张出数 × 库存）小于总需求，
+  包括全部规格因留边/朝向放不下成品而出数为 0 的情况：
+  返回 `422 Unprocessable Entity`，错误信息明确给出库存总产能与总需求，例如
+  `Value error, 无可行原纸组合：库存总产能 40 张成品印张不足以满足总需求 100 张（每册 1 张 × 印数 100）`。
+
 ## 章节分帖拼版（POST /api/v1/impose/chapters）
 在 `/api/v1/impose` 的基础上支持**章节感知**分帖：章节不可跨帖，相邻章节可合帖。
 本地访问地址 `http://localhost:8000/api/v1/impose/chapters`（改了 `HOST_PORT` 则对应替换端口）。
@@ -986,7 +1137,7 @@ pytest -q
 .
 ├── app/
 │   ├── __init__.py
-│   ├── imposition.py   # 拼版核心算法（分帖 + 帖内拼版 + 机台版面 + 瑕疵定位 + 墨区着墨面积 + 订针计划）
+│   ├── imposition.py   # 拼版核心算法（分帖 + 帖内拼版 + 机台版面 + 瑕疵定位 + 墨区着墨面积 + 订针计划 + 原纸备料）
 │   ├── proof.py        # 双面拼版校样 PDF 生成（沿用机台版面结果）
 │   ├── fonts/          # 校样 PDF 嵌入的子集化中文字体
 │   └── main.py         # FastAPI 路由与参数校验

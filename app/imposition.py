@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import math
+from fractions import Fraction
 from typing import Collection, List, Literal, Optional, Tuple, TypeVar
 
 Binding = Literal["left", "right"]
@@ -1414,4 +1415,379 @@ def staple_plan(
         "min_spacing_mm": min_spacing_mm,
         "signature_count": signature_total,
         "signatures": result_signatures,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 原纸备料（paper-stock）：成品印张开料出数与库存组合选择
+# ---------------------------------------------------------------------------
+
+# 原纸规格数量、库存张数范围
+PAPER_GRADE_MIN_COUNT = 1
+PAPER_GRADE_MAX_COUNT = 6
+PAPER_STOCK_MIN = 0
+PAPER_STOCK_MAX = 30
+
+# 纸纹方向：width=沿宽（纸纹平行于原纸宽边），height=沿高
+PaperGrain = Literal["width", "height"]
+
+# 一种原纸规格：(宽 mm 整数, 高 mm 整数, 库存张数, 纸纹)
+PaperStock = Tuple[int, int, int, PaperGrain]
+
+# 成品印张在某条轴上的计数容差：可用长、间隔均为有限 mm 数值，
+# 仅用于抵消浮点运算的 ULP 级误差，不改变整行整列排布的离散判定
+_PAPER_GRID_EPS = 1e-9
+
+
+def _grid_count(available_mm: float, item_mm: float, gap_mm: float) -> int:
+    """沿一条轴整排的个数：``available >= item`` 时为
+    ``floor((available + gap) / (item + gap))``，否则为 0。"""
+    if available_mm + _PAPER_GRID_EPS * max(1.0, available_mm, item_mm) < item_mm:
+        return 0
+    return int(
+        math.floor(
+            (available_mm + gap_mm)
+            / (item_mm + gap_mm)
+            + _PAPER_GRID_EPS * max(1.0, available_mm, item_mm)
+        )
+    )
+
+
+def plan_paper_stock(
+    total_pages: int,
+    max_sheets: int,
+    binding: Binding,
+    page_width_mm: float,
+    page_height_mm: float,
+    gutter_mm: float,
+    copies: int,
+    margin_mm: float,
+    cut_gap_mm: float,
+    papers: List[PaperStock],
+) -> dict:
+    """计算原纸备料组合。
+
+    每册印张数沿用 :func:`impose` 的分帖规则（含末帖补白，每张印张 4 页）：
+    ``sheets_per_book = ceil(total_pages / 4)``，与每帖最多张数无关；
+    总需求 ``demand = sheets_per_book × copies``。成品印张尺寸沿用
+    :func:`press_layout`：宽 ``2 × 页宽 + 中缝``、高 ``页高``，成品书脊沿页高。
+
+    每种原纸给出整数毫米宽高、库存（0～30 张）与纸纹（沿宽/沿高）。成品印张
+    只能取**书脊与纸纹平行**的唯一朝向：
+
+    - 纸纹沿宽（``"width"``）：印张高边（书脊）平行原纸宽边，
+      列方向（原纸宽）排印张高、行方向（原纸高）排印张宽；
+    - 纸纹沿高（``"height"``）：书脊平行原纸高边，
+      列方向排印张宽、行方向排印张高。
+
+    扣除四周全等留边 ``margin_mm`` 后的可用区域内按统一裁切间隔
+    ``cut_gap_mm`` 整行整列排布，单张出数 = 列数 × 行数。
+
+    在库存内选择满足总需求的用量组合，依次最小化：
+
+    1. 原纸总面积（Σ 用量 × 单张面积）；
+    2. 超产（总产量 − 总需求）；
+    3. 按输入顺序的用量向量字典序。
+
+    返回各规格用量、朝向与行列出数、总产量、余量（超产）与总面积；
+    库存总产能不足（含全部规格出数为 0）时抛 ``ValueError``。
+    """
+    if (
+        not isinstance(total_pages, int)
+        or isinstance(total_pages, bool)
+        or total_pages < 1
+    ):
+        raise ValueError("总页数 total_pages 必须为正整数")
+    if (
+        not isinstance(max_sheets, int)
+        or isinstance(max_sheets, bool)
+        or max_sheets < 1
+    ):
+        raise ValueError("每帖最多纸张数必须为正整数")
+    if binding not in ("left", "right"):
+        raise ValueError(f"非法装订方向：{binding!r}，只支持 'left' / 'right'")
+    for name, value in (
+        ("页宽", page_width_mm),
+        ("页高", page_height_mm),
+    ):
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+            or value <= 0
+        ):
+            raise ValueError(f"{name}必须为正数（有限数值，单位 mm）")
+    if (
+        not isinstance(gutter_mm, (int, float))
+        or isinstance(gutter_mm, bool)
+        or not math.isfinite(gutter_mm)
+        or gutter_mm < 0
+    ):
+        raise ValueError("中缝宽度必须为非负数（有限数值，单位 mm）")
+    if not isinstance(copies, int) or isinstance(copies, bool) or copies < 1:
+        raise ValueError("印数 copies 必须为正整数")
+    for name, value in (("四周留边", margin_mm), ("裁切间隔", cut_gap_mm)):
+        if (
+            not isinstance(value, (int, float))
+            or isinstance(value, bool)
+            or not math.isfinite(value)
+            or value < 0
+        ):
+            raise ValueError(f"{name}必须为非负数（有限数值，单位 mm）")
+    if (
+        not isinstance(papers, (list, tuple))
+        or not (PAPER_GRADE_MIN_COUNT <= len(papers) <= PAPER_GRADE_MAX_COUNT)
+    ):
+        raise ValueError(
+            f"原纸规格必须为 {PAPER_GRADE_MIN_COUNT}～{PAPER_GRADE_MAX_COUNT} 种"
+        )
+    normalized: List[Tuple[int, int, int, str]] = []
+    for index, paper in enumerate(papers, start=1):
+        if not isinstance(paper, (list, tuple)) or len(paper) != 4:
+            raise ValueError(f"第 {index} 种原纸字段不完整")
+        width, height, stock, grain = paper
+        for name, value in (("宽", width), ("高", height)):
+            if not isinstance(value, int) or isinstance(value, bool) or value < 1:
+                raise ValueError(f"第 {index} 种原纸的{name}必须为正整数（单位 mm）")
+        if (
+            not isinstance(stock, int)
+            or isinstance(stock, bool)
+            or not (PAPER_STOCK_MIN <= stock <= PAPER_STOCK_MAX)
+        ):
+            raise ValueError(
+                f"第 {index} 种原纸的库存必须为 "
+                f"{PAPER_STOCK_MIN}～{PAPER_STOCK_MAX} 的整数"
+            )
+        if grain not in ("width", "height"):
+            raise ValueError(
+                f"第 {index} 种原纸的纸纹 {grain!r} 非法："
+                "只支持 'width'（沿宽）/ 'height'（沿高）"
+            )
+        normalized.append((width, height, stock, grain))
+
+    # 沿用 impose 分帖规则：每册印张数 = 总页数（含末帖补白）/ 4
+    sheets_per_book = math.ceil(total_pages / 4)
+    demand = sheets_per_book * copies
+    # 沿用 press_layout 的成品印张尺寸（书脊沿页高方向）
+    finish_width = 2 * page_width_mm + gutter_mm
+    finish_height = page_height_mm
+
+    grades: List[dict] = []
+    for width, height, stock, grain in normalized:
+        usable_w = width - 2 * margin_mm
+        usable_h = height - 2 * margin_mm
+        if grain == "width":
+            # 书脊（印张高边）平行原纸宽边：列排印张高、行排印张宽
+            columns = _grid_count(usable_w, finish_height, cut_gap_mm)
+            rows = _grid_count(usable_h, finish_width, cut_gap_mm)
+            oriented_finish_w = finish_height
+            oriented_finish_h = finish_width
+        else:
+            # 书脊平行原纸高边：列排印张宽、行排印张高
+            columns = _grid_count(usable_w, finish_width, cut_gap_mm)
+            rows = _grid_count(usable_h, finish_height, cut_gap_mm)
+            oriented_finish_w = finish_width
+            oriented_finish_h = finish_height
+        pieces = columns * rows
+        grades.append(
+            {
+                "width_mm": width,
+                "height_mm": height,
+                "stock": stock,
+                "grain": grain,
+                "columns": columns,
+                "rows": rows,
+                "pieces_per_sheet": pieces,
+                "sheet_area_mm2": width * height,
+                "oriented_finish_width_mm": oriented_finish_w,
+                "oriented_finish_height_mm": oriented_finish_h,
+                "usable_width_mm": usable_w,
+                "usable_height_mm": usable_h,
+            }
+        )
+
+    n = len(grades)
+    yields = [g["pieces_per_sheet"] for g in grades]
+    stocks = [g["stock"] for g in grades]
+    areas = [g["sheet_area_mm2"] for g in grades]
+
+    # 库存总产能不足（含全部规格出数为 0）-> 无可行组合
+    if sum(y * s for y, s in zip(yields, stocks)) < demand:
+        raise ValueError(
+            f"无可行原纸组合：库存总产能 {sum(y * s for y, s in zip(yields, stocks))}"
+            f" 张成品印张不足以满足总需求 {demand} 张"
+            f"（每册 {sheets_per_book} 张 × 印数 {copies}）"
+        )
+
+    # 后缀最大产量：suffix_cap[i] = Σ_{j>=i} 出数[j] × 库存[j]
+    suffix_cap = [0] * (n + 1)
+    for i in range(n - 1, -1, -1):
+        suffix_cap[i] = suffix_cap[i + 1] + yields[i] * stocks[i]
+
+    # 后缀出数 gcd：suffix_gcd[i] = gcd(出数[i..n-1])（出数为 0 的规格不计）
+    suffix_gcd = [0] * (n + 1)
+    for i in range(n - 1, -1, -1):
+        suffix_gcd[i] = math.gcd(yields[i], suffix_gcd[i + 1])
+
+    # 分数松弛面积下界：剩余 need 张全部用“面积/出数”最小的规格（比例并列
+    # 取输入靠前者）补足时的面积整数下界
+    suffix_min_ratio: List[Optional[int]] = [None] * (n + 1)
+    best_j: Optional[int] = None
+    for i in range(n - 1, -1, -1):
+        if yields[i] > 0 and (
+            best_j is None
+            or Fraction(areas[i], yields[i])
+            <= Fraction(areas[best_j], yields[best_j])
+        ):
+            best_j = i
+        suffix_min_ratio[i] = best_j
+
+    def area_lower_bound(i: int, need: int) -> int:
+        """规格 i..n-1 至少补足 need 张成品印张所需的面积整数下界。"""
+        if need <= 0:
+            return 0
+        j = suffix_min_ratio[i]
+        if j is None:
+            return 0
+        return -((-need * areas[j]) // yields[j])
+
+    # ---- 阶段 1：记忆化 DP 求满足需求的最小总面积 ----
+    # dp_area(i, made) -> 规格 i..n-1 还需投入的最小面积（不依赖已用面积），
+    # 不可行返回 None；需求已满足时后缀只能取 0，投入 0。
+    area_memo: dict = {}
+
+    def dp_area(i: int, made: int) -> Optional[int]:
+        if made >= demand:
+            return 0
+        if i == n or made + suffix_cap[i] < demand:
+            return None
+        key = (i, made)
+        if key in area_memo:
+            cached = area_memo[key]
+            return cached if cached >= 0 else None
+        need = demand - made
+        y, s, a = yields[i], stocks[i], areas[i]
+        q_hi = s if y == 0 else min(s, math.ceil(need / y))
+        best: Optional[int] = None
+        for take in range(q_hi + 1):
+            new_need = need - take * y
+            if new_need > 0:
+                if take * y + suffix_cap[i + 1] < need:
+                    continue
+                lb = take * a + area_lower_bound(i + 1, new_need)
+                if best is not None and lb >= best:
+                    continue
+            suffix_area = dp_area(i + 1, made + take * y)
+            if suffix_area is None:
+                continue
+            total = take * a + suffix_area
+            if best is None or total < best:
+                best = total
+        area_memo[key] = best if best is not None else -1
+        return best
+
+    best_area = dp_area(0, 0)
+    # 库存产能检查已保证可行
+    assert best_area is not None
+
+    # ---- 阶段 2：在总面积恰为 best_area 的方案中，依次最小化超产、用量字典序 ----
+    # 自规格 0 起按用量升序深度优先搜索，首个完整可行方案即字典序最小；
+    # 面积严格限定 best_area，超产取所有等面积方案中的最小值。
+    # 剪枝（全部与前缀无关，不影响正确性）：后缀产能、分数面积下界、
+    # 后缀 gcd 整除性（剩余需求必须是后缀出数 gcd 的倍数，且不超过后缀产能）。
+    best_tie: Optional[Tuple[int, Tuple[int, ...]]] = None
+    q2 = [0] * n
+
+    def dfs_tie(i: int, made: int, used_area: int) -> None:
+        nonlocal best_tie
+        if made >= demand:
+            if used_area != best_area:
+                return
+            key = (made - demand, tuple(q2))
+            if best_tie is None or key < best_tie:
+                best_tie = key
+            return
+        if i == n or made + suffix_cap[i] < demand:
+            return
+        need = demand - made
+        if used_area + area_lower_bound(i, need) > best_area:
+            return
+        g = suffix_gcd[i]
+        # 后缀可增产都是 g 的倍数：覆盖剩余需求所需的最小 g 倍数若超过后缀
+        # 总产能则该分支不可行；该最小覆盖对应的超产 min_surplus_here 只与
+        # (i, need) 有关，与前缀无关。
+        if g > 0:
+            min_cover = ((need + g - 1) // g) * g
+            if min_cover > suffix_cap[i]:
+                return
+            min_surplus_here = min_cover - need
+        else:
+            min_surplus_here = 0
+        if best_tie is not None:
+            if min_surplus_here > best_tie[0]:
+                # 该状态能达到的最小超产已严格大于当前最佳，任何完整方案都更差
+                return
+            if (
+                tuple(q2[:i]) > best_tie[1][:i]
+                and min_surplus_here == best_tie[0]
+            ):
+                # 前缀字典序已严格更大且无法靠更小超产救回（超产相等即输）
+                return
+        y, s, a = yields[i], stocks[i], areas[i]
+        q_hi = s if y == 0 else min(s, (best_area - used_area) // a)
+        for take in range(q_hi + 1):
+            new_area = used_area + take * a
+            new_made = made + take * y
+            new_need = demand - new_made
+            if new_need > 0 and new_made + suffix_cap[i + 1] < demand:
+                continue
+            if (
+                new_need > 0
+                and new_area + area_lower_bound(i + 1, new_need) > best_area
+            ):
+                continue
+            q2[i] = take
+            dfs_tie(i + 1, new_made, new_area)
+            q2[i] = 0
+
+    dfs_tie(0, 0, 0)
+    assert best_tie is not None
+    best_surplus, best_tuple = best_tie
+    best_q = list(best_tuple)
+    best_made = demand + best_surplus
+
+    result_papers = []
+    for grade, take in zip(grades, best_q):
+        result_papers.append(
+            {
+                "width_mm": grade["width_mm"],
+                "height_mm": grade["height_mm"],
+                "stock": grade["stock"],
+                "grain": grade["grain"],
+                "used_sheets": take,
+                "columns": grade["columns"],
+                "rows": grade["rows"],
+                "pieces_per_sheet": grade["pieces_per_sheet"],
+                "sheet_area_mm2": grade["sheet_area_mm2"],
+            }
+        )
+
+    return {
+        "total_pages": total_pages,
+        "max_sheets_per_signature": max_sheets,
+        "binding": binding,
+        "page_width_mm": page_width_mm,
+        "page_height_mm": page_height_mm,
+        "gutter_mm": gutter_mm,
+        "copies": copies,
+        "margin_mm": margin_mm,
+        "cut_gap_mm": cut_gap_mm,
+        "finished_sheet_width_mm": finish_width,
+        "finished_sheet_height_mm": finish_height,
+        "sheets_per_book": sheets_per_book,
+        "demand": demand,
+        "papers": result_papers,
+        "total_area_mm2": best_area,
+        "total_produced": best_made,
+        "surplus": best_made - demand,
     }

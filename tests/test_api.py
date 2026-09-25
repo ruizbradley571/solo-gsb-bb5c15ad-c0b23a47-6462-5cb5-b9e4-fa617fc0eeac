@@ -1852,3 +1852,247 @@ def test_staple_plan_impose_inputs_reused_for_validation():
     ):
         body = {**STAPLE_PLAN_BASE, **override}
         assert client.post("/api/v1/impose/staple-plan", json=body).status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# 原纸备料 /api/v1/impose/paper-stock
+# ---------------------------------------------------------------------------
+
+PAPER_STOCK_BASE = {
+    "total_pages": 4,
+    "max_sheets_per_signature": 1,
+    "binding": "left",
+    "page_width_mm": 210.0,
+    "page_height_mm": 297.0,
+    "gutter_mm": 0.0,
+    "copies": 100,
+    "margin_mm": 10.0,
+    "cut_gap_mm": 3.0,
+    "papers": [
+        {"width_mm": 880, "height_mm": 620, "stock": 30, "grain": "width"},
+        {"width_mm": 900, "height_mm": 640, "stock": 30, "grain": "height"},
+    ],
+}
+
+
+def test_paper_stock_basic_selection():
+    response = client.post("/api/v1/impose/paper-stock", json=PAPER_STOCK_BASE)
+    assert response.status_code == 200
+    data = response.json()
+    # 成品 420x297，每册 1 张，需求 100
+    assert data["finished_sheet_width_mm"] == 420.0
+    assert data["finished_sheet_height_mm"] == 297.0
+    assert data["sheets_per_book"] == 1
+    assert data["demand"] == 100
+    a, b = data["papers"]
+    # 880x620 沿宽：列排印张高 297（2 列）、行排印张宽 420（1 行）-> 2
+    assert (a["columns"], a["rows"], a["pieces_per_sheet"]) == (2, 1, 2)
+    assert a["sheet_area_mm2"] == 880 * 620
+    # 900x640 沿高：列 2、行 2 -> 4
+    assert (b["columns"], b["rows"], b["pieces_per_sheet"]) == (2, 2, 4)
+    assert b["sheet_area_mm2"] == 900 * 640
+    # 25 张 B 恰好 100，总面积最小
+    assert [p["used_sheets"] for p in data["papers"]] == [0, 25]
+    assert data["total_area_mm2"] == 25 * 900 * 640
+    assert data["total_produced"] == 100
+    assert data["surplus"] == 0
+
+
+def test_paper_stock_padding_sheets_per_book():
+    # 5 页（含末帖补白）-> 每册 2 张 -> 需求 20
+    body = {
+        **PAPER_STOCK_BASE,
+        "total_pages": 5,
+        "copies": 10,
+    }
+    response = client.post("/api/v1/impose/paper-stock", json=body)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["sheets_per_book"] == 2
+    assert data["demand"] == 20
+    assert [p["used_sheets"] for p in data["papers"]] == [0, 5]
+    assert data["total_produced"] == 20
+
+
+def test_paper_stock_surplus_when_overshoot_required():
+    # 只用出数 4 的规格、需求 10：3 张产 12，超产 2
+    body = {
+        **PAPER_STOCK_BASE,
+        "copies": 10,
+        "papers": [
+            {"width_mm": 900, "height_mm": 640, "stock": 30, "grain": "height"},
+        ],
+    }
+    response = client.post("/api/v1/impose/paper-stock", json=body)
+    assert response.status_code == 200
+    data = response.json()
+    assert data["papers"][0]["used_sheets"] == 3
+    assert data["total_produced"] == 12
+    assert data["surplus"] == 2
+
+
+def test_paper_stock_grain_orientation_constraint():
+    # 沿宽纸纹只能旋转摆放：900x640 出 2（而非错误的 4）
+    body = {
+        **PAPER_STOCK_BASE,
+        "copies": 10,
+        "papers": [
+            {"width_mm": 900, "height_mm": 640, "stock": 30, "grain": "width"},
+        ],
+    }
+    response = client.post("/api/v1/impose/paper-stock", json=body)
+    assert response.status_code == 200
+    grade = response.json()["papers"][0]
+    assert (grade["columns"], grade["rows"], grade["pieces_per_sheet"]) == (2, 1, 2)
+    assert grade["used_sheets"] == 5
+
+
+def test_paper_stock_zero_yield_grade_still_returned():
+    # 第一种纸因留边放不下成品（出数 0），仍在响应中且用量 0
+    body = {
+        **PAPER_STOCK_BASE,
+        "copies": 10,
+        "margin_mm": 110.0,
+        "cut_gap_mm": 0.0,
+        "papers": [
+            {"width_mm": 800, "height_mm": 550, "stock": 5, "grain": "width"},
+            {"width_mm": 900, "height_mm": 640, "stock": 30, "grain": "height"},
+        ],
+    }
+    response = client.post("/api/v1/impose/paper-stock", json=body)
+    assert response.status_code == 200
+    papers = response.json()["papers"]
+    assert papers[0]["pieces_per_sheet"] == 0
+    assert papers[0]["used_sheets"] == 0
+    assert papers[1]["used_sheets"] == 10
+
+
+def test_paper_stock_infeasible_returns_422():
+    # 库存 10 张 × 出数 4 = 40 < 需求 100
+    body = {
+        **PAPER_STOCK_BASE,
+        "papers": [
+            {"width_mm": 900, "height_mm": 640, "stock": 10, "grain": "height"},
+        ],
+    }
+    response = client.post("/api/v1/impose/paper-stock", json=body)
+    assert response.status_code == 422
+    assert "无可行原纸组合" in response.json()["detail"][0]["msg"]
+
+
+def test_paper_stock_all_zero_yield_returns_422():
+    body = {
+        **PAPER_STOCK_BASE,
+        "margin_mm": 110.0,
+        "cut_gap_mm": 0.0,
+        "papers": [
+            {"width_mm": 800, "height_mm": 550, "stock": 30, "grain": "width"},
+        ],
+    }
+    response = client.post("/api/v1/impose/paper-stock", json=body)
+    assert response.status_code == 422
+
+
+def test_paper_stock_too_many_grades_returns_422():
+    body = {
+        **PAPER_STOCK_BASE,
+        "papers": [
+            {"width_mm": 1000, "height_mm": 700, "stock": 30, "grain": "height"}
+        ] * 7,
+    }
+    assert client.post("/api/v1/impose/paper-stock", json=body).status_code == 422
+
+
+def test_paper_stock_empty_papers_returns_422():
+    body = {**PAPER_STOCK_BASE, "papers": []}
+    assert client.post("/api/v1/impose/paper-stock", json=body).status_code == 422
+
+
+def test_paper_stock_stock_boundaries():
+    for stock in (-1, 31):
+        body = {
+            **PAPER_STOCK_BASE,
+            "papers": [
+                {"width_mm": 900, "height_mm": 640, "stock": stock,
+                 "grain": "height"},
+            ],
+        }
+        assert client.post("/api/v1/impose/paper-stock", json=body).status_code == 422
+
+
+def test_paper_stock_integer_fields_reject_bool_and_float():
+    for override in (
+        {"copies": True},
+        {"copies": 2.0},
+    ):
+        body = {**PAPER_STOCK_BASE, **override}
+        assert client.post("/api/v1/impose/paper-stock", json=body).status_code == 422
+    for paper in (
+        {"width_mm": 880.0, "height_mm": 620, "stock": 30, "grain": "width"},
+        {"width_mm": 880, "height_mm": True, "stock": 30, "grain": "width"},
+        {"width_mm": 880, "height_mm": 620, "stock": 3.5, "grain": "width"},
+    ):
+        body = {**PAPER_STOCK_BASE, "papers": [paper]}
+        assert client.post("/api/v1/impose/paper-stock", json=body).status_code == 422
+
+
+def test_paper_stock_dimension_validation():
+    for override in (
+        {"page_width_mm": 0},
+        {"page_height_mm": -2},
+        {"gutter_mm": -1},
+        {"margin_mm": -0.1},
+        {"cut_gap_mm": -3},
+    ):
+        body = {**PAPER_STOCK_BASE, **override}
+        assert client.post("/api/v1/impose/paper-stock", json=body).status_code == 422
+
+
+def test_paper_stock_non_finite_dimensions_return_422():
+    payload = (
+        '{"total_pages": 4, "max_sheets_per_signature": 1, "binding": "left", '
+        '"page_width_mm": 210, "page_height_mm": 297, "gutter_mm": 0, '
+        '"copies": 10, "margin_mm": NaN, "cut_gap_mm": 3, '
+        '"papers": [{"width_mm": 900, "height_mm": 640, "stock": 30, '
+        '"grain": "height"}]}'
+    )
+    response = client.post(
+        "/api/v1/impose/paper-stock",
+        content=payload,
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status_code == 422
+
+
+def test_paper_stock_invalid_grain_binding_and_impose_inputs():
+    body = {
+        **PAPER_STOCK_BASE,
+        "papers": [
+            {"width_mm": 900, "height_mm": 640, "stock": 30, "grain": "long"},
+        ],
+    }
+    assert client.post("/api/v1/impose/paper-stock", json=body).status_code == 422
+    for override in (
+        {"binding": "top"},
+        {"total_pages": 0},
+        {"max_sheets_per_signature": 0},
+        {"copies": 0},
+    ):
+        body = {**PAPER_STOCK_BASE, **override}
+        assert client.post("/api/v1/impose/paper-stock", json=body).status_code == 422
+
+
+def test_paper_stock_unknown_and_missing_fields_return_422():
+    response = client.post(
+        "/api/v1/impose/paper-stock",
+        json={**PAPER_STOCK_BASE, "extra": 1},
+    )
+    assert response.status_code == 422
+    body = dict(PAPER_STOCK_BASE)
+    del body["cut_gap_mm"]
+    assert client.post("/api/v1/impose/paper-stock", json=body).status_code == 422
+    body = {
+        **PAPER_STOCK_BASE,
+        "papers": [{"width_mm": 900, "height_mm": 640, "grain": "height"}],
+    }
+    assert client.post("/api/v1/impose/paper-stock", json=body).status_code == 422
